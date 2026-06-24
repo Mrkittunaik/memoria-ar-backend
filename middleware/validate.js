@@ -34,6 +34,20 @@ const validateUpload = [
     .isLength({ max: 500 })
     .withMessage('Description must be 500 characters or fewer'),
 
+  // videoRect arrives as a JSON string inside multipart form-data (set by the
+  // position editor on the upload screen). Optional — falls back to schema
+  // defaults (centered 9:16) if the user never touched the editor.
+  body('videoRect')
+    .optional({ checkFalsy: true })
+    .custom((value) => {
+      let parsed;
+      try { parsed = JSON.parse(value); } catch (_) {
+        throw new Error('videoRect must be valid JSON');
+      }
+      validateRectShape(parsed);
+      return true;
+    }),
+
   handleValidationErrors,
 ];
 
@@ -50,4 +64,48 @@ const validateScanLog = [
   handleValidationErrors,
 ];
 
-module.exports = { validateUpload, validateScanLog };
+/**
+ * Shared shape check for a videoRect payload — used by both the upload
+ * form (JSON string field) and the dedicated position PATCH endpoint
+ * (JSON body). Throws on the first problem found.
+ */
+function validateRectShape(rect) {
+  if (typeof rect !== 'object' || rect === null) {
+    throw new Error('videoRect must be an object');
+  }
+  const { ratio, x, y, width, height } = rect;
+
+  if (!['9:16', '1:1', '4:5'].includes(ratio)) {
+    throw new Error('videoRect.ratio must be one of 9:16, 1:1, 4:5');
+  }
+  for (const [key, val] of Object.entries({ x, y, width, height })) {
+    if (typeof val !== 'number' || Number.isNaN(val)) {
+      throw new Error(`videoRect.${key} must be a number`);
+    }
+    if (val < 0 || val > 100) {
+      throw new Error(`videoRect.${key} must be between 0 and 100`);
+    }
+  }
+}
+
+/**
+ * Validates the body of PATCH /api/memories/:id/position — a fast,
+ * metadata-only save with no file re-upload.
+ */
+const validatePosition = [
+  param('id')
+    .isMongoId()
+    .withMessage('Invalid memory id'),
+
+  body('videoRect')
+    .exists()
+    .withMessage('videoRect is required')
+    .custom((value) => {
+      validateRectShape(value);
+      return true;
+    }),
+
+  handleValidationErrors,
+];
+
+module.exports = { validateUpload, validateScanLog, validatePosition };
