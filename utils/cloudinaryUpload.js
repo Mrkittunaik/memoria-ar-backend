@@ -1,58 +1,46 @@
 const { cloudinary } = require('../config/cloudinary');
 
-/**
- * Upload a buffer to Cloudinary via upload_stream.
- *
- * @param {Buffer} buffer       - Raw file bytes (from multer memoryStorage)
- * @param {string} folder       - Destination folder on Cloudinary
- * @param {string} resourceType - 'image' | 'video' | 'raw'
- * @param {object} options      - Extra Cloudinary upload_stream options
- * @returns {Promise<object>}   - Full Cloudinary upload result
- */
 function uploadToCloudinary(buffer, folder, resourceType = 'image', options = {}) {
   return new Promise((resolve, reject) => {
-    const uploadOptions = {
-      folder,
-      resource_type: resourceType,
-      ...options,
-    };
-
-    const stream = cloudinary.uploader.upload_stream(uploadOptions, (error, result) => {
-      if (error) return reject(error);
-      resolve(result);
-    });
-
+    const stream = cloudinary.uploader.upload_stream(
+      { folder, resource_type: resourceType, ...options },
+      (error, result) => { if (error) return reject(error); resolve(result); }
+    );
     stream.end(buffer);
   });
 }
 
-/**
- * Upload a photo buffer with quality/format optimisation and metadata stripping.
- * Max width capped at 1200px; aspect ratio preserved automatically.
- */
 async function uploadPhoto(buffer) {
   return uploadToCloudinary(buffer, 'memoria/photos', 'image', {
+    // eager=false: skip synchronous transform, deliver on first request instead
     transformation: [
-      { quality: 'auto', fetch_format: 'auto', width: 1200, crop: 'limit', strip_profile: true },
+      { width: 1200, crop: 'limit', quality: 'auto:low', fetch_format: 'auto', strip_profile: true },
     ],
+    // Return immediately after upload — transformation happens async on CDN
+    eager_async: true,
   });
 }
 
-/**
- * Upload a video buffer with auto quality.
- */
 async function uploadVideo(buffer) {
   return uploadToCloudinary(buffer, 'memoria/videos', 'video', {
+    // Cap at 720p, aggressive quality, strip audio metadata, use h264 for widest compat
     transformation: [
-      { quality: 'auto', fetch_format: 'auto' },
+      {
+        width: 1280, height: 720, crop: 'limit',
+        quality: 'auto:low',
+        fetch_format: 'mp4',
+        video_codec: 'h264',
+        audio_codec: 'aac',
+        bit_rate: '800k',
+        strip_profile: true,
+      },
     ],
+    eager_async: true,
+    // Chunk large uploads — Cloudinary processes 20MB chunks in parallel
+    chunk_size: 20_000_000,
   });
 }
 
-/**
- * Delete a Cloudinary asset by public_id.
- * Swallows errors — used in cleanup paths so a failed delete doesn't mask the real error.
- */
 async function deleteFromCloudinary(publicId, resourceType = 'image') {
   try {
     await cloudinary.uploader.destroy(publicId, { resource_type: resourceType });
