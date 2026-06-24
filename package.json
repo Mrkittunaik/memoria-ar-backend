@@ -1,7 +1,7 @@
 {
   "name": "memoria-ar-backend",
   "version": "1.0.0",
-  "description": "Production backend for Memoria AR — image tracking AR web app",
+  "description": "Production backend for Memoria AR \u2014 image tracking AR web app",
   "main": "server.js",
   "engines": {
     "node": ">=18.0.0"
@@ -21,8 +21,7 @@
     "helmet": "^7.1.0",
     "mongoose": "^8.5.1",
     "morgan": "^1.10.0",
-    "multer": "^1.4.5-lts.1",
-    "uuid": "^10.0.0"
+    "multer": "^1.4.5-lts.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"
