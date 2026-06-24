@@ -3,7 +3,7 @@ const multer   = require('multer');
 const router   = express.Router();
 
 const Memory   = require('../models/Memory');
-const { validateUpload }         = require('../middleware/validate');
+const { validateUpload, validatePosition } = require('../middleware/validate');
 const { uploadPhoto, uploadVideo, deleteFromCloudinary } = require('../utils/cloudinaryUpload');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
 
@@ -75,6 +75,13 @@ router.post(
       ]);
       console.log(`[Upload] Both uploaded — photo: ${photoResult.secure_url}, video: ${videoResult.secure_url}`);
 
+      // ── Parse optional videoRect (position editor on upload screen) ─────
+      // Falls back to schema defaults (centered 9:16) if not provided.
+      let videoRect;
+      if (req.body.videoRect) {
+        try { videoRect = JSON.parse(req.body.videoRect); } catch (_) { videoRect = undefined; }
+      }
+
       // ── Persist to MongoDB ───────────────────────────────────────────────
       const memory = new Memory({
         title:         req.body.title.trim(),
@@ -87,6 +94,7 @@ router.post(
         photoHeight:   photoResult.height || null,
         videoDuration: videoResult.duration || null,
         videoSize:     videoFile.size,
+        ...(videoRect ? { videoRect } : {}),
         status:        'active',
       });
 
@@ -125,7 +133,7 @@ router.get('/targets', async (req, res, next) => {
 
     const memories = await Memory.find({ status: 'active' })
       .sort({ createdAt: 1 })
-      .select('title photoUrl videoUrl photoWidth photoHeight')
+      .select('title photoUrl videoUrl photoWidth photoHeight videoRect')
       .lean();
 
     const targets = memories.map((m) => ({
@@ -135,6 +143,7 @@ router.get('/targets', async (req, res, next) => {
       videoUrl:    m.videoUrl,
       photoWidth:  m.photoWidth,
       photoHeight: m.photoHeight,
+      videoRect:   m.videoRect,
     }));
 
     const responseBody = {
@@ -150,6 +159,28 @@ router.get('/targets', async (req, res, next) => {
 
     return res.status(200).json(responseBody);
 
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /api/memories/:id/position — fast metadata-only save ──────────────
+// Updates ONLY the video overlay position/ratio on an existing memory.
+// No file re-upload, no Cloudinary round-trip — just a DB write, so this
+// is near-instant even on a slow connection.
+router.patch('/:id/position', validatePosition, async (req, res, next) => {
+  try {
+    const memory = await Memory.findById(req.params.id);
+    if (!memory) {
+      return errorResponse(res, 'Memory not found', 404);
+    }
+
+    memory.videoRect = req.body.videoRect;
+    await memory.save();
+
+    invalidateTargetsCache();
+
+    return successResponse(res, memory.toJSON(), 'Position updated');
   } catch (err) {
     next(err);
   }
