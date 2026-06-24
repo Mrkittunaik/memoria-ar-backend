@@ -67,15 +67,13 @@ router.post(
         return errorResponse(res, 'Video file must be a video (MP4, MOV, WebM, etc.)', 400);
       }
 
-      // ── Upload photo to Cloudinary ───────────────────────────────────────
-      console.log(`[Upload] Uploading photo (${(photoFile.size / 1024).toFixed(0)} KB)…`);
-      photoResult = await uploadPhoto(photoFile.buffer);
-      console.log(`[Upload] Photo uploaded — ${photoResult.secure_url}`);
-
-      // ── Upload video to Cloudinary ───────────────────────────────────────
-      console.log(`[Upload] Uploading video (${(videoFile.size / 1024 / 1024).toFixed(1)} MB)…`);
-      videoResult = await uploadVideo(videoFile.buffer);
-      console.log(`[Upload] Video uploaded — ${videoResult.secure_url}`);
+      // ── Upload photo + video to Cloudinary in parallel ───────────────────
+      console.log(`[Upload] Starting parallel upload — photo: ${(photoFile.size/1024).toFixed(0)} KB, video: ${(videoFile.size/1024/1024).toFixed(1)} MB`);
+      [photoResult, videoResult] = await Promise.all([
+        uploadPhoto(photoFile.buffer),
+        uploadVideo(videoFile.buffer),
+      ]);
+      console.log(`[Upload] Both uploaded — photo: ${photoResult.secure_url}, video: ${videoResult.secure_url}`);
 
       // ── Persist to MongoDB ───────────────────────────────────────────────
       const memory = new Memory({
