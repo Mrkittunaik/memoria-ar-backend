@@ -21,6 +21,19 @@ const MemorySchema = new mongoose.Schema({
   photoHeight:   { type: Number, default: null },
   videoDuration: { type: Number, default: null },
   videoSize:     { type: Number, default: null },
+  // ── Video overlay position on the photo ──────────────────────────────
+  // x/y/width/height are stored as PERCENTAGES (0-100) of the photo's own
+  // width/height, so the same rect scales correctly to any screen size.
+  // ratio is the preset chosen in the editor — kept for re-opening the
+  // editor with the right preset selected; the actual box geometry is
+  // always read from x/y/width/height.
+  videoRect: {
+    ratio:  { type: String, enum: ['9:16', '1:1', '4:5'], default: '9:16' },
+    x:      { type: Number, default: 50 },  // % from left, center-anchored
+    y:      { type: Number, default: 50 },  // % from top, center-anchored
+    width:  { type: Number, default: 45 },  // % of photo width
+    height: { type: Number, default: 80 },  // % of photo height
+  },
   status: {
     type:    String,
     enum:    ['processing', 'active', 'failed'],
