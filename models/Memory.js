@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+const VALID_RATIOS = ['9:16', '1:1', '4:5', '16:9', '3:4', 'auto', 'video', 'free', 'custom'];
+
 const MemorySchema = new mongoose.Schema({
   title: {
     type:      String,
@@ -19,21 +21,29 @@ const MemorySchema = new mongoose.Schema({
   videoPublicId: { type: String, required: true },
   photoWidth:    { type: Number, default: null },
   photoHeight:   { type: Number, default: null },
+  videoWidth:    { type: Number, default: null },
+  videoHeight:   { type: Number, default: null },
   videoDuration: { type: Number, default: null },
   videoSize:     { type: Number, default: null },
-  // ── Video overlay position on the photo ──────────────────────────────
-  // x/y/width/height are stored as PERCENTAGES (0-100) of the photo's own
-  // width/height, so the same rect scales correctly to any screen size.
-  // ratio is the preset chosen in the editor — kept for re-opening the
-  // editor with the right preset selected; the actual box geometry is
-  // always read from x/y/width/height.
+
+  // Video overlay position — x/y/width/height as % of photo dimensions.
+  // ratio kept for editor UI state; geometry is always from x/y/width/height.
   videoRect: {
-    ratio:  { type: String, enum: ['9:16', '1:1', '4:5'], default: '9:16' },
-    x:      { type: Number, default: 50 },  // % from left, center-anchored
-    y:      { type: Number, default: 50 },  // % from top, center-anchored
-    width:  { type: Number, default: 45 },  // % of photo width
-    height: { type: Number, default: 80 },  // % of photo height
+    ratio:  { type: String, enum: VALID_RATIOS, default: 'auto' },
+    x:      { type: Number, default: 50 },
+    y:      { type: Number, default: 50 },
+    width:  { type: Number, default: 90 },
+    height: { type: Number, default: 90 },
   },
+
+  // Border detection result stored so scanner can use it
+  detectedBorder: {
+    xPct:  { type: Number, default: null },
+    yPct:  { type: Number, default: null },
+    wPct:  { type: Number, default: null },
+    hPct:  { type: Number, default: null },
+  },
+
   status: {
     type:    String,
     enum:    ['processing', 'active', 'failed'],
@@ -45,17 +55,14 @@ const MemorySchema = new mongoose.Schema({
   updatedAt:     { type: Date,   default: Date.now },
 });
 
-// Indexes for common query patterns
 MemorySchema.index({ status: 1 });
 MemorySchema.index({ createdAt: 1 });
 
-// Auto-update updatedAt on every save
 MemorySchema.pre('save', function (next) {
   this.updatedAt = new Date();
   next();
 });
 
-// Strip __v from JSON output
 MemorySchema.set('toJSON', {
   transform(doc, ret) {
     delete ret.__v;
