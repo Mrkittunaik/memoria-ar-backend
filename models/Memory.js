@@ -27,7 +27,6 @@ const MemorySchema = new mongoose.Schema({
   videoSize:     { type: Number, default: null },
 
   // Video overlay position — x/y/width/height as % of photo dimensions.
-  // ratio kept for editor UI state; geometry is always from x/y/width/height.
   videoRect: {
     ratio:  { type: String, enum: VALID_RATIOS, default: 'auto' },
     x:      { type: Number, default: 50 },
@@ -50,44 +49,44 @@ const MemorySchema = new mongoose.Schema({
     default: 'active',
   },
 
-  // ── Upload processing pipeline ──────────────────────────────────────────
-  // Distinct from `status` above (which gates scanner visibility via
-  // /targets). This tracks where the upload sits in the quality-check
-  // pipeline: processing -> ready (passed) or rejected (failed quality).
-  // 'failed' covers hard errors (e.g. Cloudinary/DB failure) rather than
-  // a quality rejection.
   processingStatus: {
     type:    String,
     enum:    ['processing', 'ready', 'rejected', 'failed'],
     default: 'processing',
   },
 
-  // Real, measured image-quality metrics from imageAnalysisService +
-  // qualityService. No estimated/fake values — every field here is
-  // computed directly from the uploaded photo's pixel data.
-  // NOTE: this is NOT AR tracking confidence — that requires an actual
-  // MindAR compile step, which is intentionally not implemented yet.
-  // The `tracking` block below is reserved so that step can be added
-  // later without another schema migration.
+  // Real, measured image-quality metrics (sharpness / brightness / contrast).
   quality: {
     passed:     { type: Boolean, default: null },
-    rating:     { type: Number,  default: null }, // 1-5 stars
-    label:      { type: String,  default: null }, // Excellent | Good | Fair | Poor
-    reasons:    { type: [String], default: [] },  // why it was rejected, if it was
-    warnings:   { type: [String], default: [] },  // non-blocking quality notes
+    rating:     { type: Number,  default: null },
+    label:      { type: String,  default: null },
+    reasons:    { type: [String], default: [] },
+    warnings:   { type: [String], default: [] },
     sharpness:  { type: Number,  default: null },
     brightness: { type: Number,  default: null },
     contrast:   { type: Number,  default: null },
     analyzedAt: { type: Date,    default: null },
   },
 
-  // Reserved for a future real MindAR (or equivalent) compile step.
-  // Left unpopulated by this pipeline on purpose.
+  // ── AR TRACKING DATA ──────────────────────────────────────────────────────
+  // The compiled .mind binary is stored on Cloudinary as a 'raw' asset so
+  // the scanner can fetch ONE file instead of downloading every photo and
+  // re-compiling them on the user's phone every session.
+  //
+  // mindFileUrl  — public HTTPS URL to the .mind file on Cloudinary
+  // mindPublicId — Cloudinary public_id so we can delete/replace it on update
+  // featureCount — number of feature points extracted (informational)
+  // confidence   — 0-1 quality score from the compile step
+  // status       — lifecycle: not_generated → generating → ready | failed
+  // generatedAt  — when the compile completed
   tracking: {
-    status:      { type: String, enum: ['not_generated', 'generating', 'ready', 'failed'], default: 'not_generated' },
-    confidence:  { type: Number, default: null },
-    featureCount:{ type: Number, default: null },
-    generatedAt: { type: Date,   default: null },
+    status:       { type: String, enum: ['not_generated', 'generating', 'ready', 'failed'], default: 'not_generated' },
+    mindFileUrl:  { type: String, default: null },
+    mindPublicId: { type: String, default: null },
+    confidence:   { type: Number, default: null },
+    featureCount: { type: Number, default: null },
+    generatedAt:  { type: Date,   default: null },
+    errorMessage: { type: String, default: null },
   },
 
   scanCount:     { type: Number, default: 0 },
@@ -99,6 +98,7 @@ const MemorySchema = new mongoose.Schema({
 MemorySchema.index({ status: 1 });
 MemorySchema.index({ createdAt: 1 });
 MemorySchema.index({ processingStatus: 1 });
+MemorySchema.index({ 'tracking.status': 1 });
 
 MemorySchema.pre('save', function (next) {
   this.updatedAt = new Date();
