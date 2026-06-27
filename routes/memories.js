@@ -6,6 +6,9 @@ const Memory   = require('../models/Memory');
 const { validateUpload, validatePosition } = require('../middleware/validate');
 const { uploadPhoto, uploadVideo, deleteFromCloudinary } = require('../utils/cloudinaryUpload');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
+const { validatePhoto, validateVideo } = require('../services/validationService');
+const { analyzeImage } = require('../services/imageAnalysisService');
+const { evaluateQuality } = require('../services/qualityService');
 
 // Multer — memory storage, 500 MB hard cap
 const upload = multer({
@@ -41,10 +44,34 @@ router.post(
       if (!photoFile) return errorResponse(res, 'A photo file is required', 400);
       if (!videoFile) return errorResponse(res, 'A video file is required', 400);
 
-      if (photoFile.size > 20 * 1024 * 1024) return errorResponse(res, 'Photo must be under 20 MB', 413);
+      // ── Step 1: cheap, fail-fast format/size/dimension checks ──────────
+      // Runs before any Cloudinary upload — a malformed file never leaves
+      // this process.
+      const [photoCheck, videoCheck] = await Promise.all([
+        validatePhoto(photoFile.buffer, photoFile),
+        Promise.resolve(validateVideo(videoFile)),
+      ]);
 
-      if (!photoFile.mimetype.startsWith('image/')) return errorResponse(res, 'Photo must be an image (JPEG, PNG, WebP…)', 400);
-      if (!videoFile.mimetype.startsWith('video/')) return errorResponse(res, 'Video must be a video file (MP4, MOV, WebM…)', 400);
+      const intakeErrors = [...photoCheck.errors, ...videoCheck.errors];
+      if (intakeErrors.length > 0) {
+        console.log(`[Upload] Rejected at intake — ${intakeErrors.join('; ')}`);
+        return errorResponse(res, 'Upload rejected', 400, intakeErrors);
+      }
+
+      // ── Step 2: real image-quality analysis (blur / brightness / contrast) ─
+      // Still pre-Cloudinary — a photo that fails quality never gets uploaded.
+      console.log('[Upload] Analyzing image quality…');
+      const metrics = await analyzeImage(photoFile.buffer);
+      const quality = evaluateQuality(metrics, {
+        width: metrics.originalWidth,
+        height: metrics.originalHeight,
+      });
+      console.log(`[Upload] Quality: ${quality.label} (${quality.rating}★) — sharpness=${metrics.sharpness.toFixed(1)} brightness=${metrics.brightness.toFixed(1)} contrast=${metrics.contrast.toFixed(1)} [${metrics.elapsedMs}ms]`);
+
+      if (!quality.passed) {
+        console.log(`[Upload] Rejected — quality check failed: ${quality.reasons.join('; ')}`);
+        return errorResponse(res, 'Photo quality is too low for reliable AR tracking', 422, quality.reasons);
+      }
 
       console.log(`[Upload] Uploading — photo: ${(photoFile.size/1024).toFixed(0)}KB, video: ${(videoFile.size/1024/1024).toFixed(1)}MB`);
       [photoResult, videoResult] = await Promise.all([
@@ -84,7 +111,19 @@ router.post(
         videoSize:     videoFile.size,
         ...(videoRect ? { videoRect } : {}),
         ...(detectedBorder ? { detectedBorder } : {}),
-        status: 'active',
+        status:            'active',
+        processingStatus:  'ready',
+        quality: {
+          passed:     quality.passed,
+          rating:     quality.rating,
+          label:      quality.label,
+          reasons:    quality.reasons,
+          warnings:   quality.warnings,
+          sharpness:  quality.metrics.sharpness,
+          brightness: quality.metrics.brightness,
+          contrast:   quality.metrics.contrast,
+          analyzedAt: new Date(),
+        },
       });
 
       await memory.save();
@@ -111,21 +150,38 @@ router.get('/targets', async (req, res, next) => {
     }
     const memories = await Memory.find({ status: 'active' })
       .sort({ createdAt: 1 })
-      .select('title photoUrl videoUrl photoWidth photoHeight videoWidth videoHeight videoRect detectedBorder')
+      .select('title photoUrl videoUrl videoPublicId photoWidth photoHeight videoWidth videoHeight videoRect detectedBorder')
       .lean();
 
-    const targets = memories.map((m) => ({
-      id:             m._id,
-      title:          m.title,
-      photoUrl:       m.photoUrl,
-      videoUrl:       m.videoUrl,
-      photoWidth:     m.photoWidth,
-      photoHeight:    m.photoHeight,
-      videoWidth:     m.videoWidth,
-      videoHeight:    m.videoHeight,
-      videoRect:      m.videoRect,
-      detectedBorder: m.detectedBorder,
-    }));
+    const targets = memories.map((m) => {
+      // Derive poster thumbnail URL from Cloudinary videoPublicId on the fly —
+      // no extra DB field needed. The eager transform uploaded at video
+      // creation time generates this exact URL deterministically.
+      // Format: .../upload/so_1,w_640,h_360,c_fill,f_jpg,q_auto:good/<publicId>.jpg
+      // If videoPublicId is missing (legacy entries), posterUrl is null and
+      // the frontend falls back gracefully to no-poster behaviour.
+      let posterUrl = null;
+      if (m.videoPublicId) {
+        const cloudName = m.videoUrl.match(/res\.cloudinary\.com\/([^/]+)\//)?.[1];
+        if (cloudName) {
+          posterUrl = `https://res.cloudinary.com/${cloudName}/video/upload/so_1,w_640,h_360,c_fill,f_jpg,q_auto:good/${m.videoPublicId}.jpg`;
+        }
+      }
+
+      return {
+        id:             m._id,
+        title:          m.title,
+        photoUrl:       m.photoUrl,
+        videoUrl:       m.videoUrl,
+        posterUrl,
+        photoWidth:     m.photoWidth,
+        photoHeight:    m.photoHeight,
+        videoWidth:     m.videoWidth,
+        videoHeight:    m.videoHeight,
+        videoRect:      m.videoRect,
+        detectedBorder: m.detectedBorder,
+      };
+    });
 
     const responseBody = { success: true, data: { totalTargets: targets.length, targets } };
     targetsCache = { data: responseBody, cachedAt: now };
