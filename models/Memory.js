@@ -87,6 +87,7 @@ const MemorySchema = new mongoose.Schema({
     featureCount: { type: Number, default: null },
     generatedAt:  { type: Date,   default: null },
     errorMessage: { type: String, default: null },
+    attempt:      { type: Number, default: 0 },
   },
 
   scanCount:     { type: Number, default: 0 },
