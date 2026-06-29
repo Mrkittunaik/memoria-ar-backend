@@ -219,7 +219,7 @@ router.get('/targets', async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const memory = await Memory.findById(req.params.id)
-      .select('title description videoUrl videoPublicId videoRect photoWidth photoHeight videoWidth videoHeight detectedBorder status')
+      .select('title description videoUrl videoPublicId videoRect photoWidth photoHeight videoWidth videoHeight detectedBorder status processingStatus quality')
       .lean();
     if (!memory) return errorResponse(res, 'Memory not found', 404);
     const cloudName = memory.videoUrl?.match(/res\.cloudinary\.com\/([^/]+)\//)?.[1];
@@ -245,7 +245,14 @@ router.patch('/:id/position', validatePosition, async (req, res, next) => {
 // ── GET /api/memories ─────────────────────────────────────────────────────────
 router.get('/', async (req, res, next) => {
   try {
-    const memories = await Memory.find().sort({ createdAt: -1 }).lean();
+    // Select only fields the dashboard card grid actually uses.
+    // Omitting photoPublicId, videoPublicId, raw buffer fields etc. keeps
+    // the list payload small — at 100 memories, returning every field
+    // balloons the response ~3× unnecessarily.
+    const memories = await Memory.find()
+      .sort({ createdAt: -1 })
+      .select('title description photoUrl videoUrl photoWidth photoHeight videoWidth videoHeight processingStatus quality tracking scanCount createdAt videoRect detectedBorder')
+      .lean();
     return successResponse(res, memories, 'Memories retrieved');
   } catch (err) { next(err); }
 });
