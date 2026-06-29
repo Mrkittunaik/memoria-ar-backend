@@ -88,11 +88,37 @@ async function _getMindARPage() {
   // Suppress crashes from being unhandled (page.crash fires on renderer OOM)
   _page.on('crash', () => { console.error('[Puppeteer] Page crashed — will recreate on next call'); _page = null; });
 
-  // Pin to a specific MindAR version so a CDN update can't silently break
-  // the compile API. 1.2.5 is the last stable release tested against this codebase.
-  await _page.setContent(`<!DOCTYPE html><html><body>
-    <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js"></script>
-  </body></html>`);
+  // Navigate to a blank page first, then inject the MindAR script via
+  // addScriptTag(). Unlike setContent() with an inline <script src> tag
+  // (which relies on a document.write()-style parser load that can be
+  // unreliable about firing 'load' depending on the Chromium build/flags),
+  // addScriptTag() returns a promise that only resolves once the script has
+  // actually finished downloading AND executing. Pinned to 1.2.5 so a CDN
+  // update can't silently break the compile API.
+  //
+  // Two CDN mirrors in case one is slow/unreachable from Render's network —
+  // jsDelivr first, unpkg as fallback.
+  await _page.goto('about:blank');
+  const CDN_URLS = [
+    'https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js',
+    'https://unpkg.com/mind-ar@1.2.5/dist/mindar-image.prod.js',
+  ];
+  let lastErr = null;
+  let loaded = false;
+  for (const url of CDN_URLS) {
+    try {
+      console.log(`[Tracking] Loading MindAR from ${url}`);
+      await _page.addScriptTag({ url });
+      loaded = true;
+      break;
+    } catch (err) {
+      console.error(`[Tracking] Failed to load MindAR from ${url}: ${err.message}`);
+      lastErr = err;
+    }
+  }
+  if (!loaded) {
+    throw new Error(`Could not load MindAR script from any CDN mirror: ${lastErr?.message}`);
+  }
 
   await _page.waitForFunction(() => window.MINDAR?.IMAGE?.Compiler, { timeout: 30_000 });
   console.log('[Tracking] MindAR page ready');
@@ -247,49 +273,78 @@ async function rebuildMergedMind(Memory) {
  * Runs in the background — the HTTP upload response is already sent before
  * this is called. Updates the Memory document when done.
  *
+ * Automatically retries on failure (transient CDN timeouts, Cloudinary
+ * hiccups, etc.) up to MAX_ATTEMPTS times with a short backoff between
+ * attempts, before finally marking tracking.status = 'failed'. The
+ * dashboard badge only shows "AR compile failed" once every retry has
+ * been exhausted — no manual retry call needed for ordinary transient
+ * errors.
+ *
  * @param {string} memoryId
  * @param {string} imageUrl
  * @param {object} Memory - Mongoose model
  */
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 5_000;
+
 async function generateTrackingData(memoryId, imageUrl, Memory) {
   const startMs = Date.now();
-  console.log(`[Tracking] Starting compile for memory ${memoryId}`);
 
-  try {
-    await Memory.findByIdAndUpdate(memoryId, {
-      'tracking.status': 'generating',
-      updatedAt: new Date(),
-    });
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    console.log(`[Tracking] Starting compile for memory ${memoryId} (attempt ${attempt}/${MAX_ATTEMPTS})`);
 
-    // Step 1 — compile this image
-    const mindBuffer = await _compileSingle(imageUrl);
-    console.log(`[Tracking] Compiled ${mindBuffer.length} bytes in ${Date.now() - startMs}ms`);
+    try {
+      await Memory.findByIdAndUpdate(memoryId, {
+        'tracking.status': 'generating',
+        'tracking.attempt': attempt,
+        updatedAt: new Date(),
+      });
 
-    // Step 2 — upload individual .mind file
-    const { url, publicId } = await _uploadRaw(mindBuffer, `memoria/tracking/${memoryId}`);
-    console.log(`[Tracking] Individual .mind uploaded → ${url}`);
+      // Step 1 — compile this image
+      const mindBuffer = await _compileSingle(imageUrl);
+      console.log(`[Tracking] Compiled ${mindBuffer.length} bytes in ${Date.now() - startMs}ms`);
 
-    // Step 3 — mark this memory ready before rebuilding merged,
-    // so it's included in the merge
-    await Memory.findByIdAndUpdate(memoryId, {
-      'tracking.status':       'ready',
-      'tracking.mindFileUrl':  url,
-      'tracking.mindPublicId': publicId,
-      'tracking.generatedAt':  new Date(),
-      updatedAt: new Date(),
-    });
+      // Step 2 — upload individual .mind file
+      const { url, publicId } = await _uploadRaw(mindBuffer, `memoria/tracking/${memoryId}`);
+      console.log(`[Tracking] Individual .mind uploaded → ${url}`);
 
-    // Step 4 — rebuild the single merged .mind file for all ready memories
-    await rebuildMergedMind(Memory);
+      // Step 3 — mark this memory ready before rebuilding merged,
+      // so it's included in the merge
+      await Memory.findByIdAndUpdate(memoryId, {
+        'tracking.status':       'ready',
+        'tracking.mindFileUrl':  url,
+        'tracking.mindPublicId': publicId,
+        'tracking.generatedAt':  new Date(),
+        'tracking.errorMessage': null,
+        updatedAt: new Date(),
+      });
 
-    console.log(`[Tracking] Full pipeline complete for ${memoryId} in ${Date.now() - startMs}ms`);
-  } catch (err) {
-    console.error(`[Tracking] Failed for ${memoryId}: ${err.message}`);
-    await Memory.findByIdAndUpdate(memoryId, {
-      'tracking.status':       'failed',
-      'tracking.errorMessage': err.message,
-      updatedAt: new Date(),
-    }).catch(() => {});
+      // Step 4 — rebuild the single merged .mind file for all ready memories
+      await rebuildMergedMind(Memory);
+
+      console.log(`[Tracking] Full pipeline complete for ${memoryId} in ${Date.now() - startMs}ms (attempt ${attempt})`);
+      return; // success — stop retrying
+
+    } catch (err) {
+      console.error(`[Tracking] Attempt ${attempt}/${MAX_ATTEMPTS} failed for ${memoryId}: ${err.message}`);
+
+      // A crashed page/browser may be the cause — force a fresh one on the next attempt
+      if (_page) { try { await _page.close(); } catch (_) {} _page = null; }
+
+      if (attempt === MAX_ATTEMPTS) {
+        // Out of retries — record the failure for real
+        await Memory.findByIdAndUpdate(memoryId, {
+          'tracking.status':       'failed',
+          'tracking.errorMessage': err.message,
+          updatedAt: new Date(),
+        }).catch(() => {});
+        console.error(`[Tracking] Giving up on ${memoryId} after ${attempt} attempts`);
+        return;
+      }
+
+      // Wait a bit before retrying — gives a transient CDN/network blip time to clear
+      await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+    }
   }
 }
 
