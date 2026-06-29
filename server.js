@@ -34,8 +34,12 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // ── CORS — allow Cloudflare Pages domain + local dev origins ─────────────────
+// FRONTEND_ORIGIN env var can override the production domain (e.g. a custom
+// domain like memories.example.com). Falls back to the Cloudflare Pages domain.
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'https://memoria-ar.pages.dev';
+
 const allowedOrigins = [
-  'https://memoria-ar.pages.dev',        // production Cloudflare Pages domain
+  FRONTEND_ORIGIN,
   /^https:\/\/.*\.memoria-ar\.pages\.dev$/, // preview deployments
   'http://localhost:3000',
   'http://localhost:5500',
