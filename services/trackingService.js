@@ -36,13 +36,22 @@ let _browser = null;
 
 async function _getBrowser() {
   if (_browser) return _browser;
-  const puppeteer = require('puppeteer');
+
+  // puppeteer-core + @sparticuz/chromium ship a self-contained, statically
+  // linked Chromium binary built specifically for restricted Linux
+  // environments (Render, Lambda, etc). It needs no apt-get system
+  // libraries and no separate Chrome download step at build time — the
+  // binary is already inside the npm package.
+  const puppeteer = require('puppeteer-core');
+  const chromium = require('@sparticuz/chromium');
+
+  const executablePath = await chromium.executablePath();
+
   _browser = await puppeteer.launch({
-    headless: 'new',
+    headless: chromium.headless,
+    executablePath,
     args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
+      ...chromium.args,
       '--disable-gpu',
       // WebGL is required by MindAR's Compiler which uses OffscreenCanvas/WebGL
       // internally. 'enable-webgl' is not a flag — the correct flag is:
