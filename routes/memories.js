@@ -293,9 +293,9 @@ router.get('/', async (req, res, next) => {
 });
 
 // ── POST /api/memories/:id/retry-tracking ──────────────────────────────────────
-// Re-runs the server-side .mind compile for one memory. Useful when tracking
-// got stuck at 'not_generated' (e.g. uploaded before this fix shipped) or
-// previously failed (Chromium crash, OOM, transient network error, etc).
+// Re-runs the server-side .mind compile for one memory. Useful for manually
+// forcing a retry — though generateTrackingData now retries automatically on
+// its own, so this is mainly for memories that exhausted all auto-retries.
 router.post('/:id/retry-tracking', async (req, res, next) => {
   try {
     const memory = await Memory.findById(req.params.id);
@@ -313,6 +313,115 @@ router.post('/:id/retry-tracking', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── PUT /api/memories/:id/media ─────────────────────────────────────────────────
+// Replace the photo and/or video for an existing memory. If a new photo is
+// uploaded, the old .mind tracking data is stale (it was compiled from the
+// old photo), so we automatically kick off a fresh compile in the background
+// — same self-healing retry logic as a brand new upload. Replacing only the
+// video does NOT require a recompile, since the .mind file is derived purely
+// from the photo, not the video.
+router.put(
+  '/:id/media',
+  upload.fields([
+    { name: 'photo', maxCount: 1 },
+    { name: 'video', maxCount: 1 },
+  ]),
+  async (req, res, next) => {
+    let newPhotoResult = null;
+    let newVideoResult = null;
+
+    try {
+      const memory = await Memory.findById(req.params.id);
+      if (!memory) return errorResponse(res, 'Memory not found', 404);
+
+      const photoFile = req.files?.photo?.[0];
+      const videoFile = req.files?.video?.[0];
+
+      if (!photoFile && !videoFile) {
+        return errorResponse(res, 'Provide a new photo and/or video to update', 400);
+      }
+
+      let photoChanged = false;
+      const oldPhotoPublicId = memory.photoPublicId;
+      const oldVideoPublicId = memory.videoPublicId;
+      const oldMindPublicId  = memory.tracking?.mindPublicId;
+
+      // Validate + upload whichever files were provided
+      if (photoFile) {
+        const photoCheck = await validatePhoto(photoFile.buffer, photoFile);
+        if (photoCheck.errors.length > 0) {
+          return errorResponse(res, 'Upload rejected', 400, photoCheck.errors);
+        }
+        const metrics = await analyzeImage(photoFile.buffer);
+        const quality = evaluateQuality(metrics, { width: metrics.originalWidth, height: metrics.originalHeight });
+        if (!quality.passed) {
+          return errorResponse(res, 'Photo quality is too low for reliable AR tracking', 422, quality.reasons);
+        }
+
+        newPhotoResult = await uploadPhoto(photoFile.buffer);
+        memory.photoUrl      = newPhotoResult.secure_url;
+        memory.photoPublicId = newPhotoResult.public_id;
+        memory.photoWidth    = newPhotoResult.width  || null;
+        memory.photoHeight   = newPhotoResult.height || null;
+        memory.quality = {
+          passed: quality.passed, rating: quality.rating, label: quality.label,
+          reasons: quality.reasons, warnings: quality.warnings,
+          sharpness: quality.metrics.sharpness, brightness: quality.metrics.brightness,
+          contrast: quality.metrics.contrast, analyzedAt: new Date(),
+        };
+        photoChanged = true;
+      }
+
+      if (videoFile) {
+        const videoCheck = validateVideo(videoFile);
+        if (videoCheck.errors.length > 0) {
+          return errorResponse(res, 'Upload rejected', 400, videoCheck.errors);
+        }
+        newVideoResult = await uploadVideo(videoFile.buffer);
+        memory.videoUrl      = newVideoResult.secure_url;
+        memory.videoPublicId = newVideoResult.public_id;
+        memory.videoWidth    = newVideoResult.width    || memory.videoWidth;
+        memory.videoHeight   = newVideoResult.height   || memory.videoHeight;
+        memory.videoDuration = newVideoResult.duration || memory.videoDuration;
+        memory.videoSize     = videoFile.size;
+      }
+
+      if (photoChanged) {
+        // Old .mind data is now stale — reset tracking so the dashboard
+        // shows "compiling…" rather than a misleadingly stale "ready" badge.
+        memory.tracking = { status: 'not_generated' };
+      }
+
+      await memory.save();
+      invalidateTargetsCache();
+
+      // Delete the old Cloudinary assets now that the new ones are saved
+      if (photoFile && oldPhotoPublicId) await deleteFromCloudinary(oldPhotoPublicId, 'image').catch(() => {});
+      if (videoFile && oldVideoPublicId) await deleteFromCloudinary(oldVideoPublicId, 'video').catch(() => {});
+
+      if (photoChanged) {
+        if (oldMindPublicId) await deleteTrackingFile(oldMindPublicId, Memory).catch(() => {});
+        console.log(`[Upload] Photo replaced for ${memory._id} — starting recompile in background`);
+        generateTrackingData(String(memory._id), memory.photoUrl, Memory)
+          .then(() => invalidateTargetsCache())
+          .catch(err => console.error(`[Upload] Recompile error for ${memory._id}: ${err.message}`));
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: memory.toJSON(),
+        message: photoChanged
+          ? 'Media updated — AR tracking is recompiling in the background'
+          : 'Media updated successfully',
+      });
+
+    } catch (err) {
+      if (newPhotoResult?.public_id) await deleteFromCloudinary(newPhotoResult.public_id, 'image').catch(() => {});
+      if (newVideoResult?.public_id) await deleteFromCloudinary(newVideoResult.public_id, 'video').catch(() => {});
+      next(err);
+    }
+  }
+);
 
 // ── DELETE /api/memories/:id ──────────────────────────────────────────────────
 router.delete('/:id', async (req, res, next) => {
