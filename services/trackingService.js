@@ -44,10 +44,14 @@ async function _getBrowser() {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--enable-webgl',
+      // WebGL is required by MindAR's Compiler which uses OffscreenCanvas/WebGL
+      // internally. 'enable-webgl' is not a flag — the correct flag is:
+      '--enable-unsafe-webgl',
+      '--use-gl=swiftshader',         // software WebGL renderer — no GPU needed
+      '--enable-features=Vulkan',
     ],
   });
-  _browser.on('disconnected', () => { _browser = null; });
+  _browser.on('disconnected', () => { _browser = null; _page = null; });
   return _browser;
 }
 
@@ -59,13 +63,24 @@ async function _getMindARPage() {
   const browser = await _getBrowser();
 
   // If the page was closed (crash, navigation) recreate it
-  if (_page && !_page.isClosed()) return _page;
+  if (_page) {
+    try {
+      if (!_page.isClosed()) return _page;
+    } catch (_) {
+      // isClosed() can throw if the browser itself crashed — fall through
+    }
+    _page = null;
+  }
 
   _page = await browser.newPage();
   _page.on('console', msg => {
     if (msg.type() === 'error') console.error('[Puppeteer]', msg.text());
   });
+  // Suppress crashes from being unhandled (page.crash fires on renderer OOM)
+  _page.on('crash', () => { console.error('[Puppeteer] Page crashed — will recreate on next call'); _page = null; });
 
+  // Pin to a specific MindAR version so a CDN update can't silently break
+  // the compile API. 1.2.5 is the last stable release tested against this codebase.
   await _page.setContent(`<!DOCTYPE html><html><body>
     <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js"></script>
   </body></html>`);
