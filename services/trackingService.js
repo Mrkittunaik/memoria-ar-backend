@@ -42,7 +42,7 @@ const fs   = require('fs');
 const MINDAR_VERSION   = '1.2.5';
 const MINDAR_CACHE_PATH = path.join(__dirname, '..', 'vendor', 'mindar-image.prod.js');
 const MINDAR_CDN_URLS  = [
-  `https://cdn.jsdelivr.net/npm/mind-ar@${MINDAR_VERSION}/dist/mindar-image.prod.js/+esm`,
+  `https://cdn.jsdelivr.net/npm/mind-ar@${MINDAR_VERSION}/+esm`,
   `https://unpkg.com/mind-ar@${MINDAR_VERSION}/dist/mindar-image.prod.js`,
 ];
 
@@ -174,7 +174,9 @@ async function _getMindARPage() {
   // the script wasn't downloaded yet (which shouldn't happen since we kick
   // off _ensureMindARScript() at module load, but we handle it anyway).
   const scriptContent = await _ensureMindARScript();
- await _page.addScriptTag({ content: scriptContent, type: 'module' });
+  // The +esm bundle from jsDelivr uses import/export syntax, so it must be
+  // injected as a module script, not a plain classic script.
+  await _page.addScriptTag({ content: scriptContent, type: 'module' });
 
   await _page.waitForFunction(() => window.MINDAR?.IMAGE?.Compiler, { timeout: 10_000 });
   console.log('[Tracking] MindAR page ready');
@@ -224,32 +226,37 @@ async function _compileSingle(imageUrl) {
 }
 
 /**
- * Merge an array of .mind Buffers into one combined .mind Buffer using
- * MindAR's Compiler.mergeTargets(), running inside the shared headless page.
+ * Compile multiple images into ONE combined .mind buffer in a single pass.
+ * This MindAR build (1.2.5, jsDelivr +esm bundle) does not expose a
+ * Compiler.mergeTargets() static method — verified absent from the bundle.
+ * Instead, compileImageTargets() natively accepts an array of images and
+ * produces one combined .mind file containing all of them as separate
+ * targets, indexed in the same order they were passed in.
  */
-async function _mergeMinds(buffers) {
+async function _compileAllTargets(imageUrls) {
   const page = await _getMindARPage();
 
-  // Send each buffer as base64, merge inside the page, return result as base64
-  const base64List = buffers.map(b => b.toString('base64'));
+  const dataUris = await Promise.all(imageUrls.map(_imageToDataUri));
 
-  const base64Merged = await page.evaluate(async (base64List) => {
-    const dataList = base64List.map(b64 => {
-      const binary = atob(b64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return bytes;
-    });
+  const base64Mind = await page.evaluate(async (dataUris) => {
+    const imgs = await Promise.all(dataUris.map(uri => new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = reject;
+      el.src = uri;
+    })));
 
-    const merged = window.MINDAR.IMAGE.Compiler.mergeTargets(dataList);
+    const compiler = new window.MINDAR.IMAGE.Compiler();
+    await compiler.compileImageTargets(imgs, () => {});
+    const buffer = compiler.exportData();
 
-    const bytes = new Uint8Array(merged.buffer || merged);
+    const bytes = new Uint8Array(buffer);
     let binary = '';
     for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
     return btoa(binary);
-  }, base64List);
+  }, dataUris);
 
-  return Buffer.from(base64Merged, 'base64');
+  return Buffer.from(base64Mind, 'base64');
 }
 
 /**
@@ -293,7 +300,7 @@ async function rebuildMergedMind(Memory) {
     'tracking.mindFileUrl': { $exists: true, $ne: null },
   })
     .sort({ createdAt: 1 })
-    .select('_id tracking.mindFileUrl')
+    .select('_id photoUrl')
     .lean();
 
   if (memories.length === 0) {
@@ -301,16 +308,14 @@ async function rebuildMergedMind(Memory) {
     return null;
   }
 
-  // Download all individual .mind files in parallel
-  const buffers = await Promise.all(
-    memories.map(async (m) => {
-      const res = await fetch(m.tracking.mindFileUrl);
-      if (!res.ok) throw new Error(`Failed to fetch .mind for ${m._id}: ${res.status}`);
-      return res.buffer();
-    })
-  );
-
-  const mergedBuffer = await _mergeMinds(buffers);
+  // Recompile all source photos together in one pass. This MindAR build
+  // (1.2.5, jsDelivr +esm bundle) does not expose a Compiler.mergeTargets()
+  // method — confirmed absent from the bundled file — so individually
+  // compiled .mind files can't be stitched together after the fact.
+  // compileImageTargets() natively accepts an array of images and bakes
+  // them into one combined .mind file with each image as a separate
+  // target, in the same order passed in.
+  const mergedBuffer = await _compileAllTargets(memories.map(m => m.photoUrl));
   console.log(`[Tracking] Merged ${memories.length} targets → ${mergedBuffer.length} bytes`);
 
   const { url } = await _uploadRaw(mergedBuffer, 'memoria/tracking/merged');
