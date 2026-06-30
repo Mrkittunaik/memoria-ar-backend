@@ -42,7 +42,7 @@ const fs   = require('fs');
 const MINDAR_VERSION   = '1.2.5';
 const MINDAR_CACHE_PATH = path.join(__dirname, '..', 'vendor', 'mindar-image.prod.js');
 const MINDAR_CDN_URLS  = [
-  `https://cdn.jsdelivr.net/npm/mind-ar@${MINDAR_VERSION}/dist/mindar-image.prod.js`,
+  `https://cdn.jsdelivr.net/npm/mind-ar@${MINDAR_VERSION}/dist/mindar-image.prod.js/+esm`,
   `https://unpkg.com/mind-ar@${MINDAR_VERSION}/dist/mindar-image.prod.js`,
 ];
 
@@ -174,7 +174,7 @@ async function _getMindARPage() {
   // the script wasn't downloaded yet (which shouldn't happen since we kick
   // off _ensureMindARScript() at module load, but we handle it anyway).
   const scriptContent = await _ensureMindARScript();
-  await _page.addScriptTag({ content: scriptContent });
+ await _page.addScriptTag({ content: scriptContent, type: 'module' });
 
   await _page.waitForFunction(() => window.MINDAR?.IMAGE?.Compiler, { timeout: 10_000 });
   console.log('[Tracking] MindAR page ready');
