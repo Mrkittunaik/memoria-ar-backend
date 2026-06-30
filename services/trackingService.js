@@ -30,6 +30,75 @@
 
 const { cloudinary } = require('../config/cloudinary');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+const path = require('path');
+const fs   = require('fs');
+
+// ── MindAR script bootstrap ──────────────────────────────────────────────────
+// We download the MindAR script ONCE at process startup and cache it on disk.
+// When the headless page needs it, we inject the raw JS text directly via
+// addScriptTag({ content }) instead of a URL — this removes ALL CDN dependency
+// from the compile path. A slow/blocked CDN can no longer cause compile failures.
+
+const MINDAR_VERSION   = '1.2.5';
+const MINDAR_CACHE_PATH = path.join(__dirname, '..', 'vendor', 'mindar-image.prod.js');
+const MINDAR_CDN_URLS  = [
+  `https://cdn.jsdelivr.net/npm/mind-ar@${MINDAR_VERSION}/dist/mindar-image.prod.js`,
+  `https://unpkg.com/mind-ar@${MINDAR_VERSION}/dist/mindar-image.prod.js`,
+];
+
+let _mindARScript = null; // in-memory cache of the raw JS text
+
+async function _ensureMindARScript() {
+  if (_mindARScript) return _mindARScript;
+
+  // 1. Try disk cache first (survives process restarts on same Render instance)
+  try {
+    if (fs.existsSync(MINDAR_CACHE_PATH)) {
+      _mindARScript = fs.readFileSync(MINDAR_CACHE_PATH, 'utf8');
+      if (_mindARScript.length > 10_000) {
+        console.log(`[Tracking] Loaded MindAR script from disk cache (${_mindARScript.length} chars)`);
+        return _mindARScript;
+      }
+      // Truncated/corrupt — delete and re-download
+      _mindARScript = null;
+      fs.unlinkSync(MINDAR_CACHE_PATH);
+    }
+  } catch (_) {}
+
+  // 2. Download from CDN (only happens once per cold start or after cache miss)
+  let lastErr = null;
+  for (const url of MINDAR_CDN_URLS) {
+    try {
+      console.log(`[Tracking] Downloading MindAR script from ${url}…`);
+      const res = await (await import('node-fetch')).default(url, { timeout: 30_000 });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (text.length < 10_000) throw new Error(`Response too small (${text.length} chars) — likely an error page`);
+      _mindARScript = text;
+
+      // Cache to disk so next process start doesn't need CDN either
+      try {
+        fs.mkdirSync(path.dirname(MINDAR_CACHE_PATH), { recursive: true });
+        fs.writeFileSync(MINDAR_CACHE_PATH, text, 'utf8');
+        console.log(`[Tracking] MindAR script cached to disk (${text.length} chars)`);
+      } catch (cacheErr) {
+        console.warn(`[Tracking] Could not cache to disk: ${cacheErr.message}`);
+      }
+
+      return _mindARScript;
+    } catch (err) {
+      console.error(`[Tracking] Failed to download MindAR from ${url}: ${err.message}`);
+      lastErr = err;
+    }
+  }
+  throw new Error(`Could not download MindAR script from any source: ${lastErr?.message}`);
+}
+
+// Kick off MindAR download in background immediately on module load so
+// it's ready by the time the first upload comes in — not during a compile.
+_ensureMindARScript().catch(err =>
+  console.error(`[Tracking] Background MindAR preload failed: ${err.message}`)
+);
 
 // Single browser instance reused across all compile/merge calls.
 let _browser = null;
@@ -99,28 +168,15 @@ async function _getMindARPage() {
   // Two CDN mirrors in case one is slow/unreachable from Render's network —
   // jsDelivr first, unpkg as fallback.
   await _page.goto('about:blank');
-  const CDN_URLS = [
-    'https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js',
-    'https://unpkg.com/mind-ar@1.2.5/dist/mindar-image.prod.js',
-  ];
-  let lastErr = null;
-  let loaded = false;
-  for (const url of CDN_URLS) {
-    try {
-      console.log(`[Tracking] Loading MindAR from ${url}`);
-      await _page.addScriptTag({ url });
-      loaded = true;
-      break;
-    } catch (err) {
-      console.error(`[Tracking] Failed to load MindAR from ${url}: ${err.message}`);
-      lastErr = err;
-    }
-  }
-  if (!loaded) {
-    throw new Error(`Could not load MindAR script from any CDN mirror: ${lastErr?.message}`);
-  }
 
-  await _page.waitForFunction(() => window.MINDAR?.IMAGE?.Compiler, { timeout: 30_000 });
+  // Inject the pre-downloaded MindAR script as raw text — no URL, no CDN,
+  // no network request from inside the browser. Fails fast and clearly if
+  // the script wasn't downloaded yet (which shouldn't happen since we kick
+  // off _ensureMindARScript() at module load, but we handle it anyway).
+  const scriptContent = await _ensureMindARScript();
+  await _page.addScriptTag({ content: scriptContent });
+
+  await _page.waitForFunction(() => window.MINDAR?.IMAGE?.Compiler, { timeout: 10_000 });
   console.log('[Tracking] MindAR page ready');
   return _page;
 }
