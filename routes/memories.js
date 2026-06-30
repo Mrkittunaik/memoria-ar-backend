@@ -3,6 +3,7 @@ const multer   = require('multer');
 const router   = express.Router();
 
 const Memory   = require('../models/Memory');
+const MergeState = require('../models/MergeState');
 const { validateUpload, validatePosition } = require('../middleware/validate');
 const { uploadPhoto, uploadVideo, deleteFromCloudinary } = require('../utils/cloudinaryUpload');
 const { successResponse, errorResponse } = require('../utils/responseHelper');
@@ -202,10 +203,132 @@ router.post(
   }
 );
 
+// Minimum time between merge rebuilds — keeps a busy upload period from
+// triggering a full recompile after every single photo. New uploads stay
+// instantly scannable on their own (individual .mind, already fast);
+// they just wait up to this long to be folded into the merged Final file.
+const MIN_REBUILD_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+// If a claimed build doesn't finish within this window, treat the lock as
+// stale (crashed tab, closed browser, etc.) and let another client retry.
+const BUILD_LOCK_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+
+// ── GET /api/memories/merge-status ──────────────────────────────────────────
+// Tells the caller whether a merge rebuild is actually needed right now,
+// using time + included-IDs comparison instead of rebuilding on every
+// page load. Returns shouldRebuild + photos to compile if true.
+router.get('/merge-status', async (req, res, next) => {
+  try {
+    const readyMemories = await Memory.find({
+      status: 'active',
+      'tracking.status': 'ready',
+      'tracking.mindFileUrl': { $exists: true, $ne: null },
+    })
+      .sort({ createdAt: 1 })
+      .select('_id photoUrl')
+      .lean();
+
+    const readyIds = readyMemories.map(m => String(m._id));
+
+    let state = await MergeState.findById('merge_state');
+    if (!state) state = await MergeState.create({ _id: 'merge_state' });
+
+    // Stale lock recovery — if a previous build claim never finished
+    if (state.building && state.buildStartedAt &&
+        (Date.now() - state.buildStartedAt.getTime() > BUILD_LOCK_TIMEOUT_MS)) {
+      state.building = false;
+      state.buildStartedAt = null;
+      await state.save();
+    }
+
+    if (state.building) {
+      return res.status(200).json({ success: true, data: { shouldRebuild: false, reason: 'build_in_progress' } });
+    }
+
+    const idsChanged = readyIds.length !== state.includedIds.length ||
+      readyIds.some(id => !state.includedIds.includes(id));
+
+    const timeSinceLastBuild = state.lastBuiltAt ? Date.now() - state.lastBuiltAt.getTime() : Infinity;
+    const enoughTimePassed = timeSinceLastBuild >= MIN_REBUILD_INTERVAL_MS;
+
+    // Always allow the very first build (no lastBuiltAt yet) regardless of timer
+    const shouldRebuild = readyMemories.length > 0 && idsChanged && (enoughTimePassed || !state.lastBuiltAt);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        shouldRebuild,
+        photos: shouldRebuild ? readyMemories.map(m => ({ id: String(m._id), photoUrl: m.photoUrl })) : [],
+        mergedMindUrl: state.mergedMindUrl,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/memories/merge-claim ──────────────────────────────────────────
+// A client calls this right before starting a rebuild, to claim the lock
+// so two browser tabs don't both compile at once. Returns claimed: true/false.
+router.post('/merge-claim', async (req, res, next) => {
+  try {
+    const state = await MergeState.findOneAndUpdate(
+      { _id: 'merge_state', building: { $ne: true } },
+      { building: true, buildStartedAt: new Date() },
+      { new: true, upsert: false }
+    );
+    return res.status(200).json({ success: true, data: { claimed: !!state } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/memories/merged-mind ──────────────────────────────────────────
+// Accepts a .mind file the BROWSER already compiled and stores it on
+// Cloudinary, then updates MergeState (releases the build lock, records
+// which memory IDs are now included in Final, timestamps the build).
+// No Chromium involved — replaces the old server-side rebuildMergedMind()
+// Puppeteer path, which crashed under memory pressure on this instance.
+router.post(
+  '/merged-mind',
+  upload.fields([{ name: 'mindFile', maxCount: 1 }]),
+  async (req, res, next) => {
+    try {
+      const mindFileData = req.files?.mindFile?.[0];
+      if (!mindFileData || !mindFileData.buffer?.length) {
+        return errorResponse(res, 'mindFile is required', 400);
+      }
+      let includedIds = [];
+      try { includedIds = JSON.parse(req.body.includedIds || '[]'); } catch (_) {}
+
+      console.log(`[Merge] Received client-compiled merged .mind (${mindFileData.buffer.length} bytes, ${includedIds.length} targets) — uploading…`);
+      const { url } = await uploadMindFile(mindFileData.buffer, 'memoria/tracking/merged');
+
+      await MergeState.findByIdAndUpdate(
+        'merge_state',
+        {
+          lastBuiltAt:   new Date(),
+          includedIds,
+          mergedMindUrl: url,
+          building:      false,
+          buildStartedAt: null,
+        },
+        { upsert: true }
+      );
+
+      invalidateTargetsCache();
+      console.log(`[Merge] Merged .mind uploaded → ${url}`);
+      return res.status(200).json({ success: true, data: { mergedMindUrl: url } });
+    } catch (err) {
+      // Release the lock on failure too, so a crashed compile doesn't block forever
+      await MergeState.findByIdAndUpdate('merge_state', { building: false, buildStartedAt: null }).catch(() => {});
+      next(err);
+    }
+  }
+);
+
 // ── GET /api/memories/photos-for-merge ──────────────────────────────────────
-// Returns the photo URLs (in stable order) the browser needs to fetch and
-// compile together client-side to build the merged .mind file. Lightweight —
-// no Chromium, no compile, just a DB read.
+// Kept for backward compatibility / manual triggers. Prefer /merge-status,
+// which includes the timing logic above.
 router.get('/photos-for-merge', async (req, res, next) => {
   try {
     const memories = await Memory.find({
@@ -225,31 +348,6 @@ router.get('/photos-for-merge', async (req, res, next) => {
     next(err);
   }
 });
-
-// ── POST /api/memories/merged-mind ──────────────────────────────────────────
-// Accepts a .mind file the BROWSER already compiled (from all photos in
-// /photos-for-merge) and just stores it on Cloudinary. No Chromium involved —
-// this replaces the old server-side rebuildMergedMind() Puppeteer path, which
-// was crashing under memory pressure on this Render instance.
-router.post(
-  '/merged-mind',
-  upload.fields([{ name: 'mindFile', maxCount: 1 }]),
-  async (req, res, next) => {
-    try {
-      const mindFileData = req.files?.mindFile?.[0];
-      if (!mindFileData || !mindFileData.buffer?.length) {
-        return errorResponse(res, 'mindFile is required', 400);
-      }
-      console.log(`[Merge] Received client-compiled merged .mind (${mindFileData.buffer.length} bytes) — uploading…`);
-      const { url } = await uploadMindFile(mindFileData.buffer, 'memoria/tracking/merged');
-      invalidateTargetsCache();
-      console.log(`[Merge] Merged .mind uploaded → ${url}`);
-      return res.status(200).json({ success: true, data: { mergedMindUrl: url } });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
 
 // ── GET /api/memories/targets ─────────────────────────────────────────────────
 router.get('/targets', async (req, res, next) => {
