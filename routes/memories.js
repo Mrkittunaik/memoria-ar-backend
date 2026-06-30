@@ -162,10 +162,13 @@ router.post(
           });
           console.log(`[Upload] .mind uploaded → ${url}`);
 
-          // Rebuild merged .mind synchronously so scanner sees it immediately
-          await rebuildMergedMind(Memory);
+          // NOTE: merged .mind rebuild no longer happens server-side here.
+          // Chromium on this Render instance doesn't have enough memory to
+          // reliably run the compile (causes "Promise was collected" crashes).
+          // The frontend now compiles the merged file in-browser right after
+          // this upload finishes, then POSTs it to /api/memories/merged-mind.
           invalidateTargetsCache();
-          console.log(`[Upload] Merged .mind rebuilt — total time ${Date.now() - startTime}ms`);
+          console.log(`[Upload] Individual .mind ready — total time ${Date.now() - startTime}ms`);
 
           const updated = await Memory.findById(memory._id).lean();
           return res.status(201).json({ success: true, data: updated, message: 'Memory created successfully' });
@@ -194,6 +197,55 @@ router.post(
     } catch (err) {
       if (photoResult?.public_id) await deleteFromCloudinary(photoResult.public_id, 'image').catch(() => {});
       if (videoResult?.public_id) await deleteFromCloudinary(videoResult.public_id, 'video').catch(() => {});
+      next(err);
+    }
+  }
+);
+
+// ── GET /api/memories/photos-for-merge ──────────────────────────────────────
+// Returns the photo URLs (in stable order) the browser needs to fetch and
+// compile together client-side to build the merged .mind file. Lightweight —
+// no Chromium, no compile, just a DB read.
+router.get('/photos-for-merge', async (req, res, next) => {
+  try {
+    const memories = await Memory.find({
+      status: 'active',
+      'tracking.status': 'ready',
+      'tracking.mindFileUrl': { $exists: true, $ne: null },
+    })
+      .sort({ createdAt: 1 })
+      .select('_id photoUrl')
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      data: memories.map(m => ({ id: String(m._id), photoUrl: m.photoUrl })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/memories/merged-mind ──────────────────────────────────────────
+// Accepts a .mind file the BROWSER already compiled (from all photos in
+// /photos-for-merge) and just stores it on Cloudinary. No Chromium involved —
+// this replaces the old server-side rebuildMergedMind() Puppeteer path, which
+// was crashing under memory pressure on this Render instance.
+router.post(
+  '/merged-mind',
+  upload.fields([{ name: 'mindFile', maxCount: 1 }]),
+  async (req, res, next) => {
+    try {
+      const mindFileData = req.files?.mindFile?.[0];
+      if (!mindFileData || !mindFileData.buffer?.length) {
+        return errorResponse(res, 'mindFile is required', 400);
+      }
+      console.log(`[Merge] Received client-compiled merged .mind (${mindFileData.buffer.length} bytes) — uploading…`);
+      const { url } = await uploadMindFile(mindFileData.buffer, 'memoria/tracking/merged');
+      invalidateTargetsCache();
+      console.log(`[Merge] Merged .mind uploaded → ${url}`);
+      return res.status(200).json({ success: true, data: { mergedMindUrl: url } });
+    } catch (err) {
       next(err);
     }
   }
