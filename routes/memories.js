@@ -282,6 +282,19 @@ router.post('/merge-claim', async (req, res, next) => {
   }
 });
 
+// ── POST /api/memories/merge-release ────────────────────────────────────────
+// Lets the client release the build lock immediately when a rebuild fails
+// client-side (e.g. one photo failed to load) instead of leaving every
+// future merge attempt blocked for the full BUILD_LOCK_TIMEOUT_MS.
+router.post('/merge-release', async (req, res, next) => {
+  try {
+    await MergeState.findByIdAndUpdate('merge_state', { building: false, buildStartedAt: null }).catch(() => {});
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── POST /api/memories/merged-mind ──────────────────────────────────────────
 // Accepts a .mind file the BROWSER already compiled and stores it on
 // Cloudinary, then updates MergeState (releases the build lock, records
@@ -362,7 +375,7 @@ router.get('/targets', async (req, res, next) => {
       'tracking.status': 'ready',
     })
       .sort({ createdAt: 1 })
-      .select('title videoUrl videoPublicId photoWidth photoHeight videoWidth videoHeight videoRect detectedBorder')
+      .select('title videoUrl videoPublicId photoWidth photoHeight videoWidth videoHeight videoRect detectedBorder tracking.mindFileUrl createdAt')
       .lean();
 
     if (memories.length === 0) {
@@ -375,6 +388,12 @@ router.get('/targets', async (req, res, next) => {
     const mergedMindUrl = cloudName
       ? `https://res.cloudinary.com/${cloudName}/raw/upload/memoria/tracking/merged`
       : null;
+
+    // Which memory IDs the current merged file actually contains — used so
+    // the scanner can tell "in Final already" apart from "brand new, only
+    // has its own individual .mind so far" instead of guessing from timing.
+    const mergeState = await MergeState.findById('merge_state').select('includedIds').lean();
+    const includedIds = new Set((mergeState?.includedIds || []).map(String));
 
     const targets = memories.map((m) => {
       let posterUrl = null;
@@ -392,12 +411,20 @@ router.get('/targets', async (req, res, next) => {
         videoHeight:    m.videoHeight,
         videoRect:      m.videoRect,
         detectedBorder: m.detectedBorder,
+        // Instant fallback — always populated the moment upload finishes,
+        // long before this target might make it into the merged file.
+        mindFileUrl:    m.tracking?.mindFileUrl || null,
+        inMergedFile:   includedIds.has(String(m._id)),
       };
     });
 
+    // Any ready memory NOT yet folded into Final — the scanner needs these
+    // individual .mind files to make brand-new uploads scannable right away.
+    const pendingTargets = targets.filter(t => !t.inMergedFile && t.mindFileUrl);
+
     const responseBody = {
       success: true,
-      data: { totalTargets: targets.length, mergedMindUrl, targets },
+      data: { totalTargets: targets.length, mergedMindUrl, targets, pendingTargets },
     };
     targetsCache = { data: responseBody, cachedAt: now };
     return res.status(200).json(responseBody);
